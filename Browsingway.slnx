@@ -1,0 +1,5 @@
+<Solution>
+	<Project Path="Browsingway.Common/Browsingway.Common.csproj" />
+	<Project Path="Browsingway.Renderer/Browsingway.Renderer.csproj" />
+	<Project Path="Browsingway/Browsingway.csproj" />
+</Solution>

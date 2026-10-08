@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
 using static TerraFX.Interop.DirectX.DirectX;
@@ -6,37 +8,30 @@ using static TerraFX.Interop.DirectX.D3D_DRIVER_TYPE;
 
 namespace Browsingway.Renderer;
 
-internal static unsafe class DxHandler
-{
-	private static ID3D11Device* _device;
+internal static unsafe class DxHandler {
+	public static ID3D11Device* Device { get; private set; }
 
-	public static ID3D11Device* Device => _device;
-
-	public static bool Initialise(LUID adapterLuid)
-	{
+	public static bool Initialise(LUID adapterLuid) {
 		// Find the adapter matching the luid from the parent process
 		IDXGIFactory1* factory;
-		Guid factoryGuid = typeof(IDXGIFactory1).GUID;
-		HRESULT hr = CreateDXGIFactory1(&factoryGuid, (void**)&factory);
-		if (hr.FAILED)
-		{
+		var factoryGuid = typeof(IDXGIFactory1).GUID;
+		var hr = CreateDXGIFactory1(&factoryGuid, (void**)&factory);
+		if (hr.FAILED) {
 			Console.Error.WriteLine($"FATAL: Could not create DXGI factory: {hr}");
 			return false;
 		}
 
 		IDXGIAdapter* gameAdapter = null;
-		List<LUID> foundLuids = new();
+		List<LUID> foundLuids = [];
 
 		uint i = 0;
 		IDXGIAdapter* adapter;
-		while (factory->EnumAdapters(i, &adapter) != DXGI.DXGI_ERROR_NOT_FOUND)
-		{
+		while (factory->EnumAdapters(i, &adapter) != DXGI.DXGI_ERROR_NOT_FOUND) {
 			DXGI_ADAPTER_DESC desc;
 			adapter->GetDesc(&desc);
 			foundLuids.Add(desc.AdapterLuid);
 
-			if (desc.AdapterLuid.HighPart == adapterLuid.HighPart && desc.AdapterLuid.LowPart == adapterLuid.LowPart)
-			{
+			if (desc.AdapterLuid.HighPart == adapterLuid.HighPart && desc.AdapterLuid.LowPart == adapterLuid.LowPart) {
 				gameAdapter = adapter;
 				break;
 			}
@@ -45,16 +40,15 @@ internal static unsafe class DxHandler
 			i++;
 		}
 
-		if (gameAdapter == null)
-		{
+		if (gameAdapter == null) {
 			factory->Release();
-			string foundLuidsStr = string.Join(",", foundLuids);
+			var foundLuidsStr = string.Join(",", foundLuids);
 			Console.Error.WriteLine($"FATAL: Could not find adapter matching game adapter LUID {adapterLuid}. Found: {foundLuidsStr}.");
 			return false;
 		}
 
 		// Use the adapter to build the device we'll use
-		D3D11_CREATE_DEVICE_FLAG flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+		var flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #if DEBUG
 		flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
@@ -76,8 +70,7 @@ internal static unsafe class DxHandler
 		gameAdapter->Release();
 		factory->Release();
 
-		if (hr.FAILED)
-		{
+		if (hr.FAILED) {
 			Console.Error.WriteLine($"FATAL: Could not create D3D11 device: {hr}");
 			return false;
 		}
@@ -85,16 +78,13 @@ internal static unsafe class DxHandler
 		// Release the immediate context - we get it as needed
 		context->Release();
 
-		_device = device;
+		Device = device;
 		return true;
 	}
 
-	public static void Shutdown()
-	{
-		if (_device != null)
-		{
-			_device->Release();
-			_device = null;
-		}
+	public static void Shutdown() {
+		if (Device == null) return;
+		Device->Release();
+		Device = null;
 	}
 }

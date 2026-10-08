@@ -1,11 +1,9 @@
-﻿using Browsingway.Common.Ipc;
-using System;
+﻿using System;
 using System.Threading.Tasks;
 
 namespace Browsingway.Common;
 
-public class RendererRpc(string name) : IpcBase(name)
-{
+public class RendererRpc(string name) : IpcBase(name) {
 	public event Action<NewOverlayMessage>? NewOverlay;
 	public event Action<NavigateMessage>? Navigate;
 	public event Action<ResizeOverlayMessage>? ResizeOverlay;
@@ -17,25 +15,17 @@ public class RendererRpc(string name) : IpcBase(name)
 	public event Action<MouseButtonMessage>? MouseButton;
 	public event Action<KeyEventMessage>? KeyEvent;
 
-	public async Task RendererReady(bool bHasDxSharedTexturesSupport)
-	{
-		await SendCall(new RpcCall() { RendererReady = new RendererReadyMessage() { HasDxSharedTexturesSupport = bHasDxSharedTexturesSupport } });
-	}
+	public async Task RendererReady(bool bHasDxSharedTexturesSupport) =>
+		await SendCall(new RpcCall { RendererReady = new RendererReadyMessage { HasDxSharedTexturesSupport = bHasDxSharedTexturesSupport } });
 
-	public async Task UpdateTexture(Guid id, IntPtr textureHandle)
-	{
-		await SendCall(new RpcCall() { UpdateTexture = new UpdateTextureMessage() { Guid = id.ToByteArray(), TextureHandle = (ulong)textureHandle } });
-	}
+	public async Task UpdateTexture(Guid id, IntPtr textureHandle) =>
+		await SendCall(new RpcCall { UpdateTexture = new UpdateTextureMessage { Guid = id.ToByteArray(), TextureHandle = (ulong)textureHandle } });
 
-	public async Task SetCursor(SetCursorMessage msg)
-	{
-		await SendCall(new RpcCall() { SetCursor = msg });
-	}
+	public async Task SetCursor(SetCursorMessage msg) =>
+		await SendCall(new RpcCall { SetCursor = msg });
 
-	protected override void HandleCall(RpcCall call)
-	{
-		switch (call)
-		{
+	protected override void HandleCall(RpcCall call) {
+		switch (call) {
 			case { NewOverlay: not null }:
 				NewOverlay?.Invoke(call.NewOverlay);
 				break;

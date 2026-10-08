@@ -1,45 +1,35 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
-
 	<PropertyGroup>
-		<TargetFramework>net10.0-windows</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
-		<Nullable>enable</Nullable>
-		<Configurations>Release;Debug</Configurations>
-		<Platforms>x64</Platforms>
 		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
-		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-		<LangVersion>latestmajor</LangVersion>
-		<Version>1.7.2.0</Version>
-		<OutputPath>..\out</OutputPath>
-		<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+		<OutputPath>../out</OutputPath>
+		<Name>Browsingway.WebView2</Name>
+		<Author>Styr1x, Latihas</Author>
+		<Punchline>Browser overlays rendered in-game. (WebView2, CN &amp; EN)</Punchline>
+		<Description><![CDATA[Renders browser overlays in-game to enable playing in fullscreen (and G-SYNC) while having access to ACT overlays.
+Use the settings button below or the '/bw config' command to configure.
+Based on the BrowserHost plugin by ackwell....]]></Description>
+		<RepoUrl>https://github.com/Latihas/Browsingway</RepoUrl>
+		<Tags>framework;browser;inlay;overlay;chromium;act;youtube;website;video</Tags>
+		<Changelog>- WebView2</Changelog>
 	</PropertyGroup>
-    
 	<ItemGroup>
-        <Reference Include="TerraFX.Interop.Windows">
-            <HintPath>$(DalamudLibPath)TerraFX.Interop.Windows.dll</HintPath>
-            <Private>false</Private>
-        </Reference>
-	</ItemGroup>
-	
-	<ItemGroup>
-		<PackageReference Include="SharedMemory" Version="2.3.2" />
-	</ItemGroup>
-
-	<ItemGroup>
-		<ProjectReference Include="..\Browsingway.Common\Browsingway.Common.csproj" />
-		<ProjectReference Include="..\Browsingway.Renderer\Browsingway.Renderer.csproj" ReferenceOutputAssembly="false" />
-	</ItemGroup>
-	
-	<ItemGroup>
-		<Content Include="Browsingway.json">
+		<Reference Include="TerraFX.Interop.Windows">
+			<HintPath>$(DalamudLibPath)TerraFX.Interop.Windows.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<PackageReference Include="SharedMemory" Version="2.3.2"/>
+		<ProjectReference Include="../Browsingway.Common/Browsingway.Common.csproj"/>
+		<ProjectReference Include="../Browsingway.Renderer/Browsingway.Renderer.csproj"
+		                  ReferenceOutputAssembly="false"
+		                  SkipGetTargetFrameworkProperties="true"/>
+		<Content Include="images/*">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<TargetPath>$([System.String]::Copy('%(RecursiveDir)'))%(Filename)%(Extension)</TargetPath>
 		</Content>
-		<Content Include="images\icon.png">
-			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-        <Content Include="images\dead.png">
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </Content>
 	</ItemGroup>
-	
+	<PropertyGroup Condition="'$(GITHUB_ACTIONS)' == ''">
+		<DalamudLibPath>$(appdata)/XIVLauncherCN/addon/Hooks/dev</DalamudLibPath>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(DalamudLibPath)</AssemblySearchPaths>
+	</PropertyGroup>
 </Project>

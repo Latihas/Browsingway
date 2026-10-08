@@ -1,50 +1,22 @@
-﻿using Browsingway.Common.Ipc;
-using FlatSharp;
-using SharedMemory;
-using System;
+﻿using System;
 using System.Threading.Tasks;
+using SharedMemory;
 
 namespace Browsingway.Common;
 
-public class IpcBase : IDisposable
-{
+public class IpcBase : IDisposable {
 	private readonly RpcBuffer _buffer;
 
-	protected IpcBase(string name)
-	{
-		_buffer = new RpcBuffer(name, (msgId, data) =>
-		{
-			HandleCall(RpcCall.Serializer.Parse(data));
-		});
-	}
-	
-	protected async Task SendCall(IFlatBufferSerializable msg)
-	{
-		int maxSize = msg.Serializer.GetMaxSize(msg);
-		byte[] buffer = new byte[maxSize];
-		int bytesWritten = msg.Serializer.Write(buffer, msg);
-		await _buffer.RemoteRequestAsync(buffer[..bytesWritten]);
-	}
-	
-	protected async Task<T?> SendCall<T>(IFlatBufferSerializable msg) where T : class, IFlatBufferSerializable, new()
-	{
-		int maxSize = msg.Serializer.GetMaxSize(msg);
-		byte[] buffer = new byte[maxSize];
-		int bytesWritten = msg.Serializer.Write(buffer, msg);
-		var response = await _buffer.RemoteRequestAsync(buffer[..bytesWritten]);
-		if (!response.Success)
-			return null;
+	protected IpcBase(string name) => 
+		_buffer = new RpcBuffer(name, (_, data) => HandleCall(IpcSerializer.DeserializeRpcCall(data)));
 
-		T result = new T();
-		return (T)result.Serializer.Parse(response.Data);
+	protected async Task SendCall(RpcCall msg) => await _buffer.RemoteRequestAsync(IpcSerializer.SerializeRpcCall(msg));
+
+	protected virtual void HandleCall(RpcCall call) {
 	}
 
-	protected virtual void HandleCall(RpcCall call)
-	{
-	}
-
-	public void Dispose()
-	{
+	public void Dispose() {
 		_buffer.Dispose();
+		GC.SuppressFinalize(this);
 	}
 }

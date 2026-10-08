@@ -1,18 +1,16 @@
-﻿using Browsingway.Common.Ipc;
-using Dalamud.Configuration;
+﻿using Dalamud.Configuration;
 
 namespace Browsingway;
 
 [Serializable]
-internal class Configuration : IPluginConfiguration
-{
-	public List<InlayConfiguration> Inlays = new();
-	public int Version { get; set; } = 0;
+internal class Configuration : IPluginConfiguration {
+	public List<InlayConfiguration> Inlays = [];
+	public PluginLanguage Language = PluginLanguage.Auto;
+	public int Version { get; set; }
 }
 
 [Serializable]
-internal class InlayConfiguration
-{
+internal class InlayConfiguration {
 	public bool ClickThrough;
 	public int Framerate = 60;
 	public Guid Guid;
@@ -30,5 +28,5 @@ internal class InlayConfiguration
 	public bool Fullscreen;
 	public bool HideOutOfCombat;
 	public bool HideInPvP;
-	public int HideDelay = 0;
+	public int HideDelay;
 }

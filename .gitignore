@@ -4,3 +4,5 @@ obj/
 out/
 packages/
 *.sln.DotSettings.user
+packages.lock.json
+.idea/

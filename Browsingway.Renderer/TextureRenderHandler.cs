@@ -1,178 +1,243 @@
-using Browsingway.Common.Ipc;
-using CefSharp;
-using CefSharp.Enums;
-using CefSharp.OffScreen;
-using CefSharp.Structs;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+using System.Threading;
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
-using System.Collections.Concurrent;
-using Range = CefSharp.Structs.Range;
+using Cursor = Browsingway.Common.Cursor;
 using Size = System.Drawing.Size;
 
 namespace Browsingway.Renderer;
 
-internal unsafe class TextureRenderHandler : IRenderHandler
-{
-	// CEF buffers are 32-bit BGRA
-	private const byte _bytesPerPixel = 4;
-
-	// TODO: replace with lockless implementation
-	private readonly object _renderLock = new();
-
-	// TODO: remove me
-	private byte[] _alphaLookupBuffer = Array.Empty<byte>();
-	private int _alphaLookupBufferHeight;
-	private int _alphaLookupBufferWidth;
-
-	private Cursor _cursor;
-
-	// Transparent background click-through state
-	private bool _cursorOnBackground;
-
-	private ConcurrentBag<IntPtr> _obsoleteTextures = [];
-
-	private Rect _popupRect;
-	private ID3D11Texture2D* _popupTexture;
-	private bool _popupVisible;
+internal unsafe class TextureRenderHandler : IDisposable {
+	private readonly Lock _renderLock = new();
 	private ID3D11Texture2D* _sharedTexture;
-
-	private IntPtr _sharedTextureHandle = IntPtr.Zero;
 	private ID3D11Texture2D* _viewTexture;
+	private IntPtr _sharedTextureHandle;
+	private Size _size;
+	private byte[] _alpha;
+	private Cursor _cursor = Cursor.Default;
+	private bool _cursorOnBackground;
+	private bool _disposed;
+	private bool _firstUploadLogged;
+	private readonly List<RetiredTexture> _retiredTextures = [];
 
-	public TextureRenderHandler(Size size)
-	{
-		_sharedTexture = BuildViewTexture(size, true);
-		_viewTexture = BuildViewTexture(size, false);
+	public TextureRenderHandler(Size size) {
+		_size = NormalizeSize(size);
+		_sharedTexture = BuildTexture(_size, true);
+		_viewTexture = BuildTexture(_size, false);
+		_alpha = new byte[_size.Width * _size.Height * 4];
+		ClearTextures();
 	}
 
-	public IntPtr SharedTextureHandle
-	{
-		get
-		{
-			if (_sharedTextureHandle == IntPtr.Zero)
-			{
+	public IntPtr SharedTextureHandle {
+		get {
+			lock (_renderLock) {
+				if (_disposed || _sharedTexture == null) return IntPtr.Zero;
+				if (_sharedTextureHandle != IntPtr.Zero) return _sharedTextureHandle;
 				IDXGIResource* resource;
-				Guid resourceGuid = typeof(IDXGIResource).GUID;
-				HRESULT hr = ((IUnknown*)_sharedTexture)->QueryInterface(&resourceGuid, (void**)&resource);
-				if (hr.SUCCEEDED)
-				{
-					HANDLE sharedHandle;
-					resource->GetSharedHandle(&sharedHandle);
-					_sharedTextureHandle = (IntPtr)sharedHandle.Value;
+				var guid = typeof(IDXGIResource).GUID;
+				if (((IUnknown*)_sharedTexture)->QueryInterface(&guid, (void**)&resource).SUCCEEDED) {
+					HANDLE handle;
+					resource->GetSharedHandle(&handle);
+					_sharedTextureHandle = (IntPtr)handle.Value;
 					resource->Release();
 				}
+				return _sharedTextureHandle;
 			}
-
-			return _sharedTextureHandle;
 		}
 	}
 
 	public event EventHandler<Cursor>? CursorChanged;
-
-	public void Dispose()
-	{
-		_sharedTexture->Release();
-		_viewTexture->Release();
-		if (_popupTexture != null)
-		{
-			_popupTexture->Release();
-		}
-
-		foreach (IntPtr texturePtr in _obsoleteTextures)
-		{
-			((ID3D11Texture2D*)texturePtr)->Release();
+	public int Width {
+		get {
+			lock (_renderLock) return _size.Width;
 		}
 	}
 
-	public Rect GetViewRect()
-	{
-		// There's a very small chance that OnPaint's cleanup will delete the current _sharedTexture midway through this function -
-		// Try a few times just in case before failing out with an obviously-wrong value
-		// hi adam
-		// TODO: proper threading model instead of shitty hacks
-		for (int i = 0; i < 5; i++)
-		{
-			try { return GetViewRectInternal(); }
-			catch (NullReferenceException) { }
+	public int Height {
+		get {
+			lock (_renderLock) return _size.Height;
 		}
-
-		return new Rect(0, 0, 1, 1);
 	}
 
-	public void OnAcceleratedPaint(PaintElementType type, Rect dirtyRect, AcceleratedPaintInfo acceleratedPaintInfo)
-	{
-		// TODO: use this instead of manual texture copying
-		throw new NotImplementedException();
-	}
+	public void Update(Bitmap bitmap) {
+		lock (_renderLock) {
+			if (_disposed) return;
 
-	public void OnPaint(PaintElementType type, Rect dirtyRect, IntPtr buffer, int width, int height)
-	{
-		lock (_renderLock)
-		{
-			ID3D11Texture2D* targetTexture = type switch
-			{
-				PaintElementType.View => _viewTexture,
-				PaintElementType.Popup => _popupTexture,
-				_ => throw new Exception($"Unknown paint type {type}")
-			};
-
-			if (targetTexture == null)
-			{
-				throw new Exception($"Target texture is null for paint type {type}");
+			using var converted = new Bitmap(_size.Width, _size.Height, PixelFormat.Format32bppArgb);
+			using (var graphics = Graphics.FromImage(converted)) {
+				graphics.CompositingMode = CompositingMode.SourceCopy;
+				graphics.DrawImage(
+					bitmap,
+					new Rectangle(0, 0, converted.Width, converted.Height),
+					0,
+					0,
+					bitmap.Width,
+					bitmap.Height,
+					GraphicsUnit.Pixel);
 			}
 
-			// keep buffer to make alpha checks later on.
-			// TODO: make this a back and front buffer to atomic swap them
-			if (type == PaintElementType.View)
-			{
-				// check if lookup buffer is big enough
-				int requiredBufferSize = width * height * _bytesPerPixel;
-				_alphaLookupBufferWidth = width;
-				_alphaLookupBufferHeight = height;
-				if (_alphaLookupBuffer.Length < requiredBufferSize)
-				{
-					_alphaLookupBuffer = new byte[width * height * _bytesPerPixel];
+			var data = converted.LockBits(new Rectangle(0, 0, converted.Width, converted.Height),
+				ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+			try {
+				var rowBytes = converted.Width * 4;
+				var sourceStride = Math.Abs(data.Stride);
+				var pixels = new byte[rowBytes * converted.Height];
+				for (var row = 0; row < converted.Height; row++) {
+					var sourceRow = data.Stride >= 0 ? row : converted.Height - 1 - row;
+					Marshal.Copy(
+						IntPtr.Add(data.Scan0, sourceRow * sourceStride),
+						pixels,
+						row * rowBytes,
+						rowBytes);
 				}
 
-				fixed (void* dstBuffer = _alphaLookupBuffer)
-				{
-					Buffer.MemoryCopy(buffer.ToPointer(), dstBuffer, _alphaLookupBuffer.Length, requiredBufferSize);
+				_alpha = pixels;
+				ID3D11DeviceContext* context;
+				DxHandler.Device->GetImmediateContext(&context);
+				try {
+					fixed (byte* source = pixels) {
+						context->UpdateSubresource(
+							(ID3D11Resource*)_viewTexture,
+							0,
+							null,
+							source,
+							(uint)rowBytes,
+							(uint)pixels.Length);
+					}
+
+					context->CopySubresourceRegion(
+						(ID3D11Resource*)_sharedTexture,
+						0,
+						0,
+						0,
+						0,
+						(ID3D11Resource*)_viewTexture,
+						0,
+						null);
+					context->Flush();
+				} finally {
+					context->Release();
 				}
+
+				ReleaseRetiredTextures();
+
+				if (!_firstUploadLogged) {
+					_firstUploadLogged = true;
+					var alphaSamples = 0;
+					var colorSamples = 0;
+					for (var sample = 3; sample < pixels.Length; sample += Math.Max(4, pixels.Length / 64)) {
+						if (pixels[sample] != 0) alphaSamples++;
+						if (pixels[sample - 1] != 0 || pixels[sample - 2] != 0 || pixels[sample - 3] != 0)
+							colorSamples++;
+					}
+
+					var center = converted.Height / 2 * rowBytes + converted.Width / 2 * 4;
+					Console.WriteLine(
+						$"WebView2 texture upload: size={converted.Width}x{converted.Height}, " +
+						$"firstPixel=rgba({pixels[2]},{pixels[1]},{pixels[0]},{pixels[3]}), " +
+						$"centerPixel=rgba({pixels[center + 2]},{pixels[center + 1]},{pixels[center]},{pixels[center + 3]}), " +
+						$"alphaSamples={alphaSamples}, colorSamples={colorSamples}, " +
+						$"shared=0x{SharedTextureHandle.ToInt64():X}");
+				}
+			} finally {
+				converted.UnlockBits(data);
+			}
+		}
+	}
+
+	public void Resize(Size size) {
+		lock (_renderLock) {
+			if (_disposed) return;
+
+			size = NormalizeSize(size);
+			var sharedTexture = BuildTexture(size, true);
+			var viewTexture = BuildTexture(size, false);
+			_retiredTextures.Add(new RetiredTexture(
+				_sharedTexture,
+				_viewTexture,
+				DateTime.UtcNow.AddSeconds(2)));
+			_size = size;
+			_sharedTexture = sharedTexture;
+			_viewTexture = viewTexture;
+			_alpha = new byte[_size.Width * _size.Height * 4];
+			_sharedTextureHandle = IntPtr.Zero;
+			_firstUploadLogged = false;
+			ClearTextures();
+		}
+	}
+
+	public void SetMousePosition(int x, int y) {
+		bool transparent;
+		lock (_renderLock) {
+			var offset = Math.Clamp(y, 0, Math.Max(0, _size.Height - 1)) * _size.Width * 4 +
+			             Math.Clamp(x, 0, Math.Max(0, _size.Width - 1)) * 4 + 3;
+			transparent = offset >= 0 && offset < _alpha.Length && _alpha[offset] == 0;
+			if (transparent == _cursorOnBackground) return;
+			_cursorOnBackground = transparent;
+		}
+
+		CursorChanged?.Invoke(this, transparent ? Cursor.BrowsingwayNoCapture : _cursor);
+	}
+
+	public void SetCursor(Cursor cursor) {
+		bool changed;
+		lock (_renderLock) {
+			changed = _cursor != cursor;
+			_cursor = cursor;
+		}
+
+		if (changed && !_cursorOnBackground)
+			CursorChanged?.Invoke(this, cursor);
+	}
+
+	public void Dispose() {
+		lock (_renderLock) {
+			if (_disposed) return;
+			_disposed = true;
+			if (_sharedTexture != null) {
+				_sharedTexture->Release();
+				_sharedTexture = null;
 			}
 
-			// Calculate offset multipliers for the current buffer
-			int rowPitch = width * _bytesPerPixel;
-			int depthPitch = rowPitch * height;
+			if (_viewTexture != null) {
+				_viewTexture->Release();
+				_viewTexture = null;
+			}
 
-			// Build the destination region for the dirty rect that we'll draw to
-			D3D11_TEXTURE2D_DESC texDesc;
-			targetTexture->GetDesc(&texDesc);
+			foreach (var retired in _retiredTextures)
+				retired.Release();
+			_retiredTextures.Clear();
+		}
+	}
 
-			IntPtr sourceRegionPtr = buffer + (dirtyRect.X * _bytesPerPixel) + (dirtyRect.Y * rowPitch);
-			D3D11_BOX destinationBox = new()
-			{
-				top = (uint)Math.Min(dirtyRect.Y, (int)texDesc.Height),
-				bottom = (uint)Math.Min(dirtyRect.Y + dirtyRect.Height, (int)texDesc.Height),
-				left = (uint)Math.Min(dirtyRect.X, (int)texDesc.Width),
-				right = (uint)Math.Min(dirtyRect.X + dirtyRect.Width, (int)texDesc.Width),
-				front = 0,
-				back = 1
-			};
+	private void ReleaseRetiredTextures() {
+		var now = DateTime.UtcNow;
+		for (var index = _retiredTextures.Count - 1; index >= 0; index--) {
+			if (_retiredTextures[index].ReleaseAt > now)
+				continue;
 
-			// Draw to the target
+			_retiredTextures[index].Release();
+			_retiredTextures.RemoveAt(index);
+		}
+	}
+
+	private void ClearTextures() {
+		var clear = new byte[_size.Width * _size.Height * 4];
+		fixed (byte* source = clear) {
 			ID3D11DeviceContext* context;
 			DxHandler.Device->GetImmediateContext(&context);
-
 			context->UpdateSubresource(
-				(ID3D11Resource*)targetTexture,
+				(ID3D11Resource*)_viewTexture,
 				0,
-				&destinationBox,
-				sourceRegionPtr.ToPointer(),
-				(uint)rowPitch,
-				(uint)depthPitch);
-
-			// composite final picture
-			// draw view layer, first
+				null,
+				source,
+				(uint)(_size.Width * 4),
+				(uint)clear.Length);
 			context->CopySubresourceRegion(
 				(ID3D11Resource*)_sharedTexture,
 				0,
@@ -182,254 +247,39 @@ internal unsafe class TextureRenderHandler : IRenderHandler
 				(ID3D11Resource*)_viewTexture,
 				0,
 				null);
-
-			// draw popup layer if required
-			if (_popupVisible && _popupTexture != null)
-			{
-				Point popupPos = DpiScaling.ScaleScreenPoint(_popupRect.X, _popupRect.Y);
-				context->CopySubresourceRegion(
-					(ID3D11Resource*)_sharedTexture,
-					0,
-					(uint)popupPos.X,
-					(uint)popupPos.Y,
-					0,
-					(ID3D11Resource*)_popupTexture,
-					0,
-					null);
-			}
-
 			context->Flush();
 			context->Release();
-
-			// Rendering is complete, clean up any obsolete textures
-			ConcurrentBag<IntPtr> textures = _obsoleteTextures;
-			_obsoleteTextures = new ConcurrentBag<IntPtr>();
-			foreach (IntPtr texPtr in textures)
-			{
-				((ID3D11Texture2D*)texPtr)->Release();
-			}
 		}
 	}
 
-	public void OnPopupShow(bool show)
-	{
-		_popupVisible = show;
-	}
-
-	public void OnPopupSize(Rect rect)
-	{
-		_popupRect = DpiScaling.ScaleScreenRect(rect);
-
-		// I'm really not sure if this happens. If it does, frequently - will probably need 2x shared textures and some jazz.
-		D3D11_TEXTURE2D_DESC texDesc;
-		_sharedTexture->GetDesc(&texDesc);
-		if (_popupRect.Width > texDesc.Width || _popupRect.Height > texDesc.Height)
-		{
-			Console.Error.WriteLine(
-				$"Trying to build popup layer ({_popupRect.Width}x{_popupRect.Height}) larger than primary surface ({texDesc.Width}x{texDesc.Height}).");
-		}
-
-		// Get a reference to the old _sharedTexture, we'll make sure to assign a new _sharedTexture before disposing the old one.
-		ID3D11Texture2D* oldTexture = _popupTexture;
-
-		// Build a _sharedTexture for the new sized popup
-		_popupTexture = BuildViewTexture(new Size(_popupRect.Width, _popupRect.Height), false);
-
-		if (oldTexture != null)
-		{
-			oldTexture->Release();
-		}
-	}
-
-	public ScreenInfo? GetScreenInfo()
-	{
-		return new ScreenInfo {DeviceScaleFactor = DpiScaling.GetDeviceScale()};
-	}
-
-	public bool GetScreenPoint(int viewX, int viewY, out int screenX, out int screenY)
-	{
-		screenX = viewX;
-		screenY = viewY;
-
-		return false;
-	}
-
-	public void OnVirtualKeyboardRequested(IBrowser browser, TextInputMode inputMode)
-	{
-	}
-
-	public void OnImeCompositionRangeChanged(Range selectedRange, Rect[] characterBounds)
-	{
-	}
-
-	public void OnCursorChange(IntPtr cursorPtr, CursorType type, CursorInfo customCursorInfo)
-	{
-		_cursor = EncodeCursor(type);
-
-		// If we're on background, don't flag a cursor change
-		if (!_cursorOnBackground) { CursorChanged?.Invoke(this, _cursor); }
-	}
-
-	public bool StartDragging(IDragData dragData, DragOperationsMask mask, int x, int y)
-	{
-		// Returning false to abort drag operations.
-		return false;
-	}
-
-	public void UpdateDragCursor(DragOperationsMask operation)
-	{
-	}
-
-	public void Resize(Size size)
-	{
-		lock (_renderLock)
-		{
-			// TODO: make this thread unsafe crap thread safe crap
-			ID3D11Texture2D* oldTexture1 = _sharedTexture;
-			ID3D11Texture2D* oldTexture2 = _viewTexture;
-			_sharedTexture = BuildViewTexture(size, true);
-			_viewTexture = BuildViewTexture(size, false);
-			_obsoleteTextures.Add((IntPtr)oldTexture1);
-			_obsoleteTextures.Add((IntPtr)oldTexture2);
-
-			// Need to clear the cached handle value
-			// TODO: Maybe I should just avoid the lazy cache and do it eagerly on _sharedTexture build.
-			_sharedTextureHandle = IntPtr.Zero;
-		}
-	}
-
-	protected byte GetAlphaAt(int x, int y)
-	{
-		lock (_renderLock)
-		{
-			int rowPitch = _alphaLookupBufferWidth * _bytesPerPixel;
-
-			// Get the offset for the alpha of the cursor's current position. Bitmap buffer is BGRA, so +3 to get alpha byte
-			int cursorAlphaOffset = 0
-			                        + (Math.Min(Math.Max(x, 0), _alphaLookupBufferWidth - 1) * _bytesPerPixel)
-			                        + (Math.Min(Math.Max(y, 0), _alphaLookupBufferHeight - 1) * rowPitch)
-			                        + 3;
-			cursorAlphaOffset = cursorAlphaOffset < 0 ? 0 : cursorAlphaOffset;
-
-			if (cursorAlphaOffset < _alphaLookupBuffer.Length)
-			{
-				return _alphaLookupBuffer[cursorAlphaOffset];
-			}
-
-			Console.WriteLine("Could not determine alpha value");
-			return 255;
-		}
-	}
-
-	private ID3D11Texture2D* BuildViewTexture(Size size, bool isShared)
-	{
-		// Build _sharedTexture. Most of these properties are defined to match how CEF exposes the render buffer.
-		D3D11_TEXTURE2D_DESC desc = new()
-		{
-			Width = (uint)size.Width,
-			Height = (uint)size.Height,
+	private static ID3D11Texture2D* BuildTexture(Size size, bool shared) {
+		D3D11_TEXTURE2D_DESC desc = new() {
+			Width = (uint)Math.Max(1, size.Width),
+			Height = (uint)Math.Max(1, size.Height),
 			MipLevels = 1,
 			ArraySize = 1,
 			Format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
-			SampleDesc = new DXGI_SAMPLE_DESC { Count = 1, Quality = 0 },
+			SampleDesc = new DXGI_SAMPLE_DESC { Count = 1 },
 			Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT,
 			BindFlags = (uint)D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
-			CPUAccessFlags = 0,
-			MiscFlags = isShared ? (uint)D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_SHARED : 0
+			MiscFlags = shared ? (uint)D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_SHARED : 0
 		};
-
 		ID3D11Texture2D* texture;
-		HRESULT hr = DxHandler.Device->CreateTexture2D(&desc, null, &texture);
-		if (hr.FAILED)
-		{
-			throw new Exception($"Failed to create texture: {hr}");
-		}
-
-		return texture;
+		var hr = DxHandler.Device->CreateTexture2D(&desc, null, &texture);
+		return hr.FAILED ? throw new Exception($"Failed to create texture: {hr}") : texture;
 	}
 
-	private Rect GetViewRectInternal()
-	{
-		D3D11_TEXTURE2D_DESC texDesc;
-		_sharedTexture->GetDesc(&texDesc);
-		return DpiScaling.ScaleViewRect(new Rect(0, 0, (int)texDesc.Width, (int)texDesc.Height));
-	}
+	private static Size NormalizeSize(Size size) =>
+		new(Math.Max(1, size.Width), Math.Max(1, size.Height));
 
-	public void SetMousePosition(int x, int y)
-	{
-		byte alpha = GetAlphaAt(x, y);
+	private readonly struct RetiredTexture(ID3D11Texture2D* shared, ID3D11Texture2D* view, DateTime releaseAt) {
+		private ID3D11Texture2D* Shared { get; } = shared;
+		private ID3D11Texture2D* View { get; } = view;
+		public DateTime ReleaseAt { get; } = releaseAt;
 
-		// We treat 0 alpha as click through - if changed, fire off the event
-		bool currentlyOnBackground = alpha == 0;
-		if (currentlyOnBackground != _cursorOnBackground)
-		{
-			_cursorOnBackground = currentlyOnBackground;
-
-			// EDGE CASE: if cursor transitions onto alpha:0 _and_ between two native cursor types, I guess this will be a race cond.
-			// Not sure if should have two separate upstreams for them, or try and prevent the race. consider.
-			CursorChanged?.Invoke(this, currentlyOnBackground ? Cursor.BrowsingwayNoCapture : _cursor);
+		public void Release() {
+			if (Shared != null) Shared->Release();
+			if (View != null) View->Release();
 		}
-	}
-
-	private Cursor EncodeCursor(CursorType cursor)
-	{
-		switch (cursor)
-		{
-			// CEF calls default "pointer", and pointer "hand".
-			case CursorType.Pointer: return Cursor.Default;
-			case CursorType.Cross: return Cursor.Crosshair;
-			case CursorType.Hand: return Cursor.Pointer;
-			case CursorType.IBeam: return Cursor.Text;
-			case CursorType.Wait: return Cursor.Wait;
-			case CursorType.Help: return Cursor.Help;
-			case CursorType.EastResize: return Cursor.EResize;
-			case CursorType.NorthResize: return Cursor.NResize;
-			case CursorType.NortheastResize: return Cursor.NeResize;
-			case CursorType.NorthwestResize: return Cursor.NwResize;
-			case CursorType.SouthResize: return Cursor.SResize;
-			case CursorType.SoutheastResize: return Cursor.SeResize;
-			case CursorType.SouthwestResize: return Cursor.SwResize;
-			case CursorType.WestResize: return Cursor.WResize;
-			case CursorType.NorthSouthResize: return Cursor.NsResize;
-			case CursorType.EastWestResize: return Cursor.EwResize;
-			case CursorType.NortheastSouthwestResize: return Cursor.NeswResize;
-			case CursorType.NorthwestSoutheastResize: return Cursor.NwseResize;
-			case CursorType.ColumnResize: return Cursor.ColResize;
-			case CursorType.RowResize: return Cursor.RowResize;
-
-			// There isn't really support for panning right now. Default to all-scroll.
-			case CursorType.MiddlePanning:
-			case CursorType.EastPanning:
-			case CursorType.NorthPanning:
-			case CursorType.NortheastPanning:
-			case CursorType.NorthwestPanning:
-			case CursorType.SouthPanning:
-			case CursorType.SoutheastPanning:
-			case CursorType.SouthwestPanning:
-			case CursorType.WestPanning:
-				return Cursor.AllScroll;
-
-			case CursorType.Move: return Cursor.Move;
-			case CursorType.VerticalText: return Cursor.VerticalText;
-			case CursorType.Cell: return Cursor.Cell;
-			case CursorType.ContextMenu: return Cursor.ContextMenu;
-			case CursorType.Alias: return Cursor.Alias;
-			case CursorType.Progress: return Cursor.Progress;
-			case CursorType.NoDrop: return Cursor.NoDrop;
-			case CursorType.Copy: return Cursor.Copy;
-			case CursorType.None: return Cursor.None;
-			case CursorType.NotAllowed: return Cursor.NotAllowed;
-			case CursorType.ZoomIn: return Cursor.ZoomIn;
-			case CursorType.ZoomOut: return Cursor.ZoomOut;
-			case CursorType.Grab: return Cursor.Grab;
-			case CursorType.Grabbing: return Cursor.Grabbing;
-
-			// Not handling custom for now
-			case CursorType.Custom: return Cursor.Default;
-		}
-
-		// Unmapped cursor, log and default
-		Console.WriteLine($"Switching to unmapped cursor type {cursor}.");
-		return Cursor.Default;
 	}
 }
